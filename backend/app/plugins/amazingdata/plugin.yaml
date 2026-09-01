@@ -1,0 +1,9 @@
+name: amazingdata
+display_name: "星耀数智 AmazingData"
+runtime: python
+entry: app.plugins.amazingdata.provider:AmazingDataProvider
+check: app.plugins.amazingdata.provider:availability
+datasets: [daily, adj_factor, minute]
+hidden: false
+description: "星耀数智官方 A 股行情插件原型。首期声明已验证的原始日K、累计复权因子和1分钟K；实时快照和财务数据在完成接口与口径对账前不声明。"
+install_hint: "安装并配置 AmazingData 官方 Python SDK；凭证仅从 AMAZINGDATA_USERNAME、AMAZINGDATA_PASSWORD、AMAZINGDATA_HOST、AMAZINGDATA_PORT 环境变量读取。"
