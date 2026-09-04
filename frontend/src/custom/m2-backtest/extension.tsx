@@ -89,13 +89,13 @@ function fmtPct(value: number): string {
   return `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`
 }
 
-/** 日期转后端可解析的 datetime 字符串；end 覆盖到当日 23:59:59 */
-function toStartIso(date: string): string {
-  return date ? `${date}T00:00:00` : ''
+/** 日期转后端可解析的 datetime 字符串；end 覆盖到当日 23:59:59。空值返回 null 交由后端按可选字段处理。 */
+function toStartIso(date: string): string | null {
+  return date ? `${date}T00:00:00` : null
 }
 
-function toEndIso(date: string): string {
-  return date ? `${date}T23:59:59` : ''
+function toEndIso(date: string): string | null {
+  return date ? `${date}T23:59:59` : null
 }
 
 const STATUS_LABEL: Record<string, string> = {
