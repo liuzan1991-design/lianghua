@@ -107,6 +107,37 @@ def _detect_userdata() -> str:
     return ""
 
 
+def _quant_python() -> str:
+    """`live_run.py` 的生产解释器 —— **不能用后端 venv 的 sys.executable**。
+
+    quant_app 的硬约束（项目备忘 §1）：`AmazingData`（星耀 SDK）只装在
+    `D:\\Anaconda3`，后端 venv 里没有。而 `core/data_fetch.py:254` 是**延迟 import**，
+    所以用 venv 启动不会当场报错 —— 进程能起来、心跳能写，但第一次取数就失败，
+    表现成"在运行却永远采不到数据"。比启动即崩更难查，所以必须显式指定。
+    """
+    env = os.getenv("QUANT_PYTHON", "").strip()
+    if env and Path(env).is_file():
+        return env
+    for cand in (r"D:\Anaconda3\python.exe", r"C:\ProgramData\Anaconda3\python.exe"):
+        if Path(cand).is_file():
+            return cand
+    return sys.executable
+
+
+def _quant_python_ok() -> tuple[str, bool]:
+    """返回 (解释器路径, 是否具备 AmazingData)。
+
+    用「查 site-packages 目录」而不是起子进程 import —— health 会被前端每 15s 轮询，
+    起进程要 1~2 秒，会把健康检查拖成负担。目录存在基本等价于可 import。
+    """
+    py = _quant_python()
+    root = Path(py).parent
+    for sub in ("Lib/site-packages", "lib/site-packages"):
+        if (root / sub / "AmazingData").is_dir():
+            return py, True
+    return py, False
+
+
 def _cfg() -> dict:
     def _int(name: str, default: int) -> int:
         try:
@@ -252,11 +283,15 @@ def health() -> dict:
     cfg = _cfg()
     engine = Path(cfg["engine_root"])
     qmt_py = (engine / "core" / "qmt_broker.py").is_file()
+    qpy, qpy_ok = _quant_python_ok()
     return {
         "extension": EXTENSION_ID,
         "api_version": EXTENSION_API_VERSION,
         "engine_root": str(engine),
         "engine_ok": qmt_py,
+        # 启动 live 用的解释器：必须是装了 AmazingData 的那个，否则"能起但采不到数"
+        "quant_python": qpy,
+        "quant_python_ok": qpy_ok,
         "userdata_configured": bool(cfg["userdata_mini"]),
         "userdata_source": cfg["userdata_source"],   # env / auto / missing
         "userdata_path": cfg["userdata_mini"] or None,
@@ -436,9 +471,15 @@ def live_start(request: Request, x_trade_arm: str | None = Header(default=None))
         raise HTTPException(503, f"找不到 {entry}")
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = _LOG_DIR / f"live_{datetime.now():%Y%m%d_%H%M%S}.log"
+    py, py_ok = _quant_python_ok()
+    if not py_ok:
+        raise HTTPException(
+            503,
+            f"解释器 {py} 缺少 AmazingData（星耀 SDK），启动后能起但采不到数据。"
+            "请用 QUANT_PYTHON 指定 quant_app 的生产解释器（如 D:\\Anaconda3\\python.exe）。")
     try:
         _runner = subprocess.Popen(  # noqa: S603
-            [sys.executable, str(entry)], cwd=str(engine),
+            [py, str(entry)], cwd=str(engine),
             stdout=log.open("w", encoding="utf-8"), stderr=subprocess.STDOUT,
             env={**os.environ, "TRADE_STARTED_BY": "tsp-trade"})
     except Exception as exc:  # noqa: BLE001

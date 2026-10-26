@@ -45,7 +45,11 @@ interface Health {
   extension: string
   engine_root: string
   engine_ok: boolean
+  quant_python?: string
+  quant_python_ok?: boolean
   userdata_configured: boolean
+  userdata_source?: 'env' | 'auto' | 'missing'
+  userdata_path?: string | null
   broker_ready: boolean
   limits: Limits
   gate: GateState
@@ -655,6 +659,20 @@ function LiveTradePage() {
               启动的是 quant_app 的 live_run.py（与计划任务同一入口），不是本页另起一套。
             </span>
           </div>
+          {/* 解释器必须含 AmazingData，否则"进程能起但采不到数"，比启动失败更难查 */}
+          {health?.quant_python && (
+            <div className="mt-1.5 text-[10px] text-muted">
+              启动解释器：
+              <span className="font-mono text-secondary">{health.quant_python}</span>
+              {health.quant_python_ok ? (
+                <span className="ml-1.5 text-success">含 AmazingData ✓</span>
+              ) : (
+                <span className="ml-1.5 text-danger">
+                  缺 AmazingData —— 启动会被拒绝（用 QUANT_PYTHON 指定 Anaconda）
+                </span>
+              )}
+            </div>
+          )}
 
           {/* 心跳新鲜度：heartbeat.json 跨进程留存，进程死了它还在，必须显式标龄 */}
           {live?.heartbeat && (

@@ -241,6 +241,50 @@ def test_live_stop_explains_external_instance(client, monkeypatch, tmp_path) -> 
     assert "计划任务" in r.json()["detail"]
 
 
+# ── live 解释器：不能用后端 venv（缺 AmazingData，会"能起但采不到数"）──────────
+def test_quant_python_env_override(monkeypatch, tmp_path) -> None:
+    fake = tmp_path / "py.exe"
+    fake.write_bytes(b"")
+    monkeypatch.setenv("QUANT_PYTHON", str(fake))
+    assert lt._quant_python() == str(fake)
+
+
+def test_quant_python_ok_false_when_amazingdata_missing(monkeypatch, tmp_path) -> None:
+    """解释器目录里没有 AmazingData ⇒ 必须判不合格（这是"静默采不到数"的源头）。"""
+    (tmp_path / "Lib" / "site-packages").mkdir(parents=True)
+    fake = tmp_path / "python.exe"
+    fake.write_bytes(b"")
+    monkeypatch.setenv("QUANT_PYTHON", str(fake))
+    py, ok = lt._quant_python_ok()
+    assert py == str(fake)
+    assert ok is False
+
+
+def test_quant_python_ok_true_when_amazingdata_present(monkeypatch, tmp_path) -> None:
+    (tmp_path / "Lib" / "site-packages" / "AmazingData").mkdir(parents=True)
+    fake = tmp_path / "python.exe"
+    fake.write_bytes(b"")
+    monkeypatch.setenv("QUANT_PYTHON", str(fake))
+    _, ok = lt._quant_python_ok()
+    assert ok is True
+
+
+def test_live_start_rejects_interpreter_without_amazingdata(
+        client, monkeypatch, tmp_path) -> None:
+    """解释器不合格时必须 503 并说清原因，**不能默默起一个采不到数的进程**。"""
+    (tmp_path / "lib" / "site-packages").mkdir(parents=True)  # 无 AmazingData
+    fake = tmp_path / "python.exe"
+    fake.write_bytes(b"")
+    monkeypatch.setenv("QUANT_PYTHON", str(fake))
+    monkeypatch.setattr(lt, "_ENGINE_ROOT", tmp_path)
+    (tmp_path / "live_run.py").write_text("# stub\n", encoding="utf-8")
+    monkeypatch.setattr(lt, "_runner", None)
+    tok = _arm(client, monkeypatch)
+    r = client.post("/api/custom/trade/live/start", headers={"X-Trade-Arm": tok})
+    assert r.status_code == 503
+    assert "AmazingData" in r.json()["detail"]
+
+
 # ── 正常路径：用假 broker 验证下单会被记账 ───────────────────────────────
 class _FakeResult:
     ok = True
