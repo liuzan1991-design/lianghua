@@ -1,0 +1,12 @@
+# AmazingData 插件的 pip 依赖（界面「安装」按钮执行 uv/pip install -r 本文件）。
+#
+# ⚠️ 厂商 SDK 不在 PyPI、无法由本文件安装，由部署时从 D:\Anaconda3\Lib\site-packages
+#    复制进后端 venv（两处 Python 均为 3.13.9，.pyc 兼容；版本不同会 import 失败）：
+#      - AmazingData 1.1.9（.pyc 编译分发）
+#      - tgw 1.0.9.2（AmazingData 的行情网关依赖，同样 .pyc 分发）
+#    ⚠️ 漂移提醒：Anaconda 侧 SDK 升级后需重新复制。
+polars>=1.0
+pydantic>=2.6.4
+numba>=0.65.0
+scipy>=1.15.1
+statsmodels>=0.11.0
