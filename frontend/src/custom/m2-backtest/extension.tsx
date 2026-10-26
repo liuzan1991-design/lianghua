@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import * as echarts from 'echarts'
+import type { ECharts, EChartsOption } from 'echarts'
 import { LineChart, Loader2, Play, Square, RotateCcw } from 'lucide-react'
 import type { FrontendExtension } from '@/extensions/types'
 import { PageHeader } from '@/components/PageHeader'
+import { useChartTheme } from '@/lib/theme'
 import { cn } from '@/lib/cn'
 
 /** M2 做T回测只读页面：接 M2 六个接口，只做历史回测，不含任何交易。 */
@@ -199,6 +202,11 @@ function M2BacktestPage() {
   const [tradesExpanded, setTradesExpanded] = useState(false)
   const tradesRunRef = useRef<string | null>(null)
 
+  // 权益曲线：run 完成后自动拉 equity.csv
+  const [equity, setEquity] = useState<{ times: number[]; values: number[]; closes: number[] } | null>(null)
+  const [equityLoading, setEquityLoading] = useState(false)
+  const [equityError, setEquityError] = useState<string | null>(null)
+
   const pollTimer = useRef<number | null>(null)
   const esRef = useRef<EventSource | null>(null)
 
@@ -244,12 +252,13 @@ function M2BacktestPage() {
     setParamValues(next)
   }, [selectedStrategy])
 
-  // 回测完成且产出 trades.csv → 自动拉取并解析交易明细
+  // 回测完成且产出 trades.csv / equity.csv → 自动拉取解析（并行）
   useEffect(() => {
     const rid = run?.run_id
     if (!rid || run?.status !== 'completed' || !run.artifacts.includes('trades.csv')) return
     if (tradesRunRef.current === rid) return
     tradesRunRef.current = rid
+
     setTradesLoading(true)
     setTradesError(null)
     fetch(`${BASE}/backtests/${rid}/artifacts/trades.csv`)
@@ -266,6 +275,40 @@ function M2BacktestPage() {
         setTradesError(err instanceof Error ? err.message : String(err))
       })
       .finally(() => setTradesLoading(false))
+
+    if (run.artifacts.includes('equity.csv')) {
+      setEquityLoading(true)
+      setEquityError(null)
+      fetch(`${BASE}/backtests/${rid}/artifacts/equity.csv`)
+        .then(res => {
+          if (!res.ok) throw new Error(`加载权益曲线失败 (${res.status})`)
+          return res.text()
+        })
+        .then(text => {
+          const parsed = parseCsv(text)
+          const ti = parsed.columns.indexOf('time')
+          const ei = parsed.columns.indexOf('equity')
+          const ci = parsed.columns.indexOf('close')
+          if (ti < 0 || ei < 0) throw new Error('equity.csv 缺少 time/equity 列')
+          const times: number[] = []
+          const values: number[] = []
+          const closes: number[] = []
+          for (const row of parsed.rows) {
+            const t = Date.parse(row[ti])
+            const v = Number(row[ei])
+            if (!Number.isFinite(t) || !Number.isFinite(v)) continue
+            times.push(t)
+            values.push(v)
+            closes.push(ci >= 0 ? Number(row[ci]) : NaN)
+          }
+          setEquity(times.length > 0 ? { times, values, closes } : null)
+        })
+        .catch(err => {
+          setEquity(null)
+          setEquityError(err instanceof Error ? err.message : String(err))
+        })
+        .finally(() => setEquityLoading(false))
+    }
   }, [run])
 
   const refreshRun = useCallback(async (runId: string) => {
@@ -376,6 +419,8 @@ function M2BacktestPage() {
     setError(null)
     setTrades(null)
     setTradesError(null)
+    setEquity(null)
+    setEquityError(null)
     tradesRunRef.current = null
   }, [clearTimers])
 
@@ -598,6 +643,31 @@ function M2BacktestPage() {
               {' · '}权益行数 <span className="text-secondary font-mono">{run.result.equity_rows}</span>
             </div>
 
+            {/* 权益曲线：账户权益 vs 标的等权持有基准，虚线为初始资金 */}
+            {run.status === 'completed' && run.artifacts.includes('equity.csv') && (
+              <div className="space-y-2 border-t border-border pt-3">
+                <div className="text-xs font-medium text-secondary">权益曲线</div>
+                {equityLoading && (
+                  <div className="flex items-center gap-2 text-xs text-muted py-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> 加载权益曲线…
+                  </div>
+                )}
+                {equityError && (
+                  <div className="rounded-btn border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+                    {equityError}
+                  </div>
+                )}
+                {equity && !equityLoading && (
+                  <EquityChart
+                    times={equity.times}
+                    values={equity.values}
+                    closes={equity.closes}
+                    initCash={run.request.init_cash as number}
+                  />
+                )}
+              </div>
+            )}
+
             {/* 交易明细：run 完成后自动拉 trades.csv 渲染；前 50 行内联，可展开 */}
             {run.status === 'completed' && run.artifacts.includes('trades.csv') && (
               <div className="space-y-2 border-t border-border pt-3">
@@ -704,6 +774,115 @@ function M2BacktestPage() {
       </div>
     </>
   )
+}
+
+/** 权益曲线图：账户权益 vs 标的等权持有（close 归一到初始资金），虚线为初始资金。 */
+function EquityChart({ times, values, closes, initCash }: {
+  times: number[]
+  values: number[]
+  closes: number[]
+  initCash: number
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const chartRef = useRef<ECharts | null>(null)
+  const ct = useChartTheme()
+
+  useEffect(() => {
+    if (!containerRef.current) return
+    const chart = echarts.init(containerRef.current)
+    chartRef.current = chart
+    const onResize = () => chart.resize()
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.removeEventListener('resize', onResize)
+      chart.dispose()
+      chartRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+    // 标的持有基准：close 归一到「初始资金全仓买入」
+    const firstClose = closes.find(v => Number.isFinite(v) && v > 0)
+    const benchmark: [number, number][] = []
+    if (firstClose) {
+      for (let i = 0; i < times.length; i++) {
+        if (Number.isFinite(closes[i]) && closes[i] > 0) {
+          benchmark.push([times[i], +(initCash * closes[i] / firstClose).toFixed(2)])
+        }
+      }
+    }
+    const equityData: [number, number][] = times.map((t, i) => [t, +values[i].toFixed(2)])
+
+    const option: EChartsOption = {
+      animation: false,
+      backgroundColor: 'transparent',
+      grid: { left: 8, right: 8, top: 24, bottom: 8, containLabel: true },
+      legend: {
+        top: 0,
+        textStyle: { color: ct.text, fontSize: 11 },
+        itemWidth: 14,
+      },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: ct.tooltipBg,
+        borderColor: ct.tooltipBorder,
+        textStyle: { color: ct.tooltipText, fontSize: 11 },
+        valueFormatter: (v) => typeof v === 'number' ? v.toLocaleString('zh-CN', { maximumFractionDigits: 0 }) : String(v),
+      },
+      xAxis: {
+        type: 'time',
+        axisLine: { lineStyle: { color: ct.border } },
+        axisLabel: { color: ct.text, fontSize: 10 },
+        splitLine: { show: false },
+      },
+      yAxis: {
+        type: 'value',
+        scale: true,
+        axisLine: { show: false },
+        axisLabel: {
+          color: ct.text,
+          fontSize: 10,
+          formatter: (v: number) => v >= 10000 ? `${(v / 10000).toFixed(1)}万` : String(v),
+        },
+        splitLine: { lineStyle: { color: ct.grid } },
+      },
+      series: [
+        {
+          name: '账户权益',
+          type: 'line',
+          data: equityData,
+          showSymbol: false,
+          sampling: 'lttb',
+          lineStyle: { width: 1.5, color: '#3B82F6' },
+          areaStyle: { color: 'rgba(59,130,246,0.12)' },
+          markLine: {
+            silent: true,
+            symbol: 'none',
+            label: {
+              color: ct.textStrong,
+              fontSize: 10,
+              formatter: `初始 ${initCash.toLocaleString('zh-CN')}`,
+            },
+            lineStyle: { color: ct.crosshair, type: 'dashed', width: 1 },
+            data: [{ yAxis: initCash }],
+          },
+        },
+        ...(benchmark.length > 0 ? [{
+          name: '标的等权持有',
+          type: 'line' as const,
+          data: benchmark,
+          showSymbol: false,
+          sampling: 'lttb' as const,
+          lineStyle: { width: 1, color: '#F59E0B', opacity: 0.85 },
+        }] : []),
+      ],
+    }
+    chart.setOption(option, { notMerge: true })
+  }, [times, values, closes, initCash, ct])
+
+  return <div ref={containerRef} className="w-full h-64" />
 }
 
 /** 参数控件：checkbox 原生勾选框；number/slider 数字输入（带 min/max/step）；select 下拉。 */
