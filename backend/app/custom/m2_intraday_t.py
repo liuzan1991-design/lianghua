@@ -39,6 +39,86 @@ _STRATEGIES = {
 }
 
 
+def _quant_python() -> str:
+    """quant_app 生产解释器 —— 主进程 venv 没有 pandas，不能直接 import strategies。"""
+    env = os.getenv("QUANT_PYTHON", "").strip()
+    if env and Path(env).is_file():
+        return env
+    for cand in (r"D:\Anaconda3\python.exe", r"C:\ProgramData\Anaconda3\python.exe"):
+        if Path(cand).is_file():
+            return cand
+    return sys.executable
+
+
+# 读取策略参数元数据的脚本：借 quant_app 的解释器跑，JSON 写到 argv[2]（写文件比
+# 解析 stdout 稳 —— Anaconda 启动时可能往 stdout 混入告警行）。
+_META_SCRIPT = '''# -*- coding: utf-8 -*-
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from strategies import STRATEGIES  # noqa: E402
+
+out = {}
+for sid, cls in STRATEGIES.items():
+    out[sid] = {
+        "name": getattr(cls, "name", sid),
+        "description": getattr(cls, "description", ""),
+        "param_meta": [
+            {
+                "key": m.key, "label": m.label, "default": m.default,
+                "kind": m.kind, "min": m.min, "max": m.max, "step": m.step,
+                "options": list(m.options) if m.options else None,
+                "help": m.help, "group": m.group,
+            }
+            for m in getattr(cls, "param_meta", [])
+        ],
+    }
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(out, handle, ensure_ascii=False)
+'''
+
+_STRATEGY_META_CACHE: dict[str, Any] | None = None
+_STRATEGY_META_DONE = False
+_STRATEGY_META_LOCK = threading.Lock()
+
+
+def strategy_meta(engine_root: Path) -> dict[str, Any] | None:
+    """读取 quant_app 各策略的 param_meta（含默认值/min/max/分组），进程内缓存。
+
+    失败后不再重试（避免每次 /strategies 请求都起子进程）；重启进程才重读。
+    失败时返回 None，list_strategies 退回静态表 —— 页面仍可用，只是没有参数表单。
+    """
+    global _STRATEGY_META_CACHE, _STRATEGY_META_DONE
+    with _STRATEGY_META_LOCK:
+        if _STRATEGY_META_DONE:
+            return _STRATEGY_META_CACHE
+        _STRATEGY_META_DONE = True
+        _STRATEGY_META_CACHE = _load_strategy_meta(engine_root)
+        return _STRATEGY_META_CACHE
+
+
+def _load_strategy_meta(engine_root: Path) -> dict[str, Any] | None:
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="m2_meta_") as tmp:
+            script = Path(tmp) / "dump_meta.py"
+            out = Path(tmp) / "meta.json"
+            script.write_text(_META_SCRIPT, encoding="utf-8")
+            proc = subprocess.run(
+                [_quant_python(), str(script), str(engine_root), str(out)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=120,
+            )
+            if proc.returncode != 0 or not out.is_file():
+                return None
+            data = json.loads(out.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) and data else None
+    except Exception:  # noqa: BLE001  元数据读取失败不应影响回测主链路
+        return None
+
+
 class BacktestRequest(BaseModel):
     strategy_id: str
     symbol: str = Field(pattern=r"^\d{6}(?:\.(?:SH|SZ|BJ))?$")
@@ -100,7 +180,14 @@ class M2BacktestService:
         self.cleanup()
 
     def list_strategies(self) -> list[dict[str, Any]]:
-        return [{"id": key, **value} for key, value in _STRATEGIES.items()]
+        # 元数据来自 quant_app 真实注册表（含 ParamMeta），读到就以它为准；
+        # 读不到退回静态表（无 param_meta，前端不渲染参数表单但其余功能正常）。
+        meta = strategy_meta(self.engine_root)
+        items: list[dict[str, Any]] = []
+        for key, value in _STRATEGIES.items():
+            entry = dict(meta[key]) if meta and key in meta else dict(value)
+            items.append({"id": key, **entry})
+        return items
 
     def create(self, request: BacktestRequest) -> dict:
         if request.strategy_id not in _STRATEGIES:
@@ -330,7 +417,8 @@ router = APIRouter(prefix="/api/custom/m2", tags=["custom-m2"])
 def health() -> dict:
     return {"status": "ok", "mode": "backtest-only", "process_isolation": True,
             "amazingdata_sdk_allowed": False, "engine_available": SERVICE.engine_root.is_dir(),
-            "data_available": SERVICE.data_root.is_dir(), "worker_available": _WORKER.is_file()}
+            "data_available": SERVICE.data_root.is_dir(), "worker_available": _WORKER.is_file(),
+            "strategy_meta_loaded": strategy_meta(SERVICE.engine_root) is not None}
 
 
 @router.get("/backtests/{run_id}/artifacts")

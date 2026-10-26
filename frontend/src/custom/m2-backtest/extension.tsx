@@ -13,12 +13,35 @@ const SSE_EVENT_NAMES = [
   'cancelled', 'interrupted', 'timeout', 'cancel_requested',
 ]
 
+interface ParamMetaField {
+  key: string
+  label: string
+  default: unknown
+  kind: string
+  min?: number | null
+  max?: number | null
+  step?: number | null
+  options?: unknown[] | null
+  help?: string
+  group?: string
+}
+
 interface Strategy {
   id: string
   name: string
   description: string
-  default_params?: Record<string, unknown>
+  param_meta?: ParamMetaField[]
 }
+
+const GROUP_LABEL: Record<string, string> = {
+  core: '核心参数',
+  risk: '风控参数',
+  cost: '交易成本',
+}
+
+/** 交易明细表：前 50 行内联展示，可展开到 500 行；更多走下载。 */
+const TRADES_INLINE_LIMIT = 50
+const TRADES_EXPAND_LIMIT = 500
 
 interface RunSummary {
   strategy_id: string
@@ -89,6 +112,38 @@ function fmtPct(value: number): string {
   return `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`
 }
 
+/** 简易 CSV 解析：处理双引号转义与字段内逗号/换行。trades.csv 由 pandas 写出，首行为表头。 */
+function parseCsv(text: string): { columns: string[]; rows: string[][] } {
+  const rows: string[][] = []
+  let field = ''
+  let row: string[] = []
+  let inQuotes = false
+  let started = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++ } else inQuotes = false
+      } else field += ch
+    } else if (ch === '"' && !started) {
+      inQuotes = true; started = true
+    } else if (ch === ',') {
+      row.push(field); field = ''; started = false
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++
+      row.push(field); field = ''; started = false
+      if (row.some(cell => cell !== '')) rows.push(row)
+      row = []
+    } else {
+      field += ch; started = true
+    }
+  }
+  row.push(field)
+  if (row.some(cell => cell !== '')) rows.push(row)
+  if (rows.length === 0) return { columns: [], rows: [] }
+  return { columns: rows[0], rows: rows.slice(1) }
+}
+
 /** 日期转后端可解析的 datetime 字符串；end 覆盖到当日 23:59:59。空值返回 null 交由后端按可选字段处理。 */
 function toStartIso(date: string): string | null {
   return date ? `${date}T00:00:00` : null
@@ -134,6 +189,16 @@ function M2BacktestPage() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // 参数表单：数字/文本存字符串便于输入，checkbox 存布尔；切换策略时重置为默认值
+  const [paramValues, setParamValues] = useState<Record<string, string | boolean>>({})
+
+  // 交易明细：run 完成后自动拉 trades.csv
+  const [trades, setTrades] = useState<{ columns: string[]; rows: string[][] } | null>(null)
+  const [tradesLoading, setTradesLoading] = useState(false)
+  const [tradesError, setTradesError] = useState<string | null>(null)
+  const [tradesExpanded, setTradesExpanded] = useState(false)
+  const tradesRunRef = useRef<string | null>(null)
+
   const pollTimer = useRef<number | null>(null)
   const esRef = useRef<EventSource | null>(null)
 
@@ -168,6 +233,40 @@ function M2BacktestPage() {
     () => strategies.find(s => s.id === strategyId) ?? null,
     [strategies, strategyId],
   )
+
+  // 策略切换 → 用该策略的默认值重填参数表单
+  useEffect(() => {
+    if (!selectedStrategy?.param_meta) { setParamValues({}); return }
+    const next: Record<string, string | boolean> = {}
+    for (const m of selectedStrategy.param_meta) {
+      next[m.key] = typeof m.default === 'boolean' ? m.default : String(m.default ?? '')
+    }
+    setParamValues(next)
+  }, [selectedStrategy])
+
+  // 回测完成且产出 trades.csv → 自动拉取并解析交易明细
+  useEffect(() => {
+    const rid = run?.run_id
+    if (!rid || run?.status !== 'completed' || !run.artifacts.includes('trades.csv')) return
+    if (tradesRunRef.current === rid) return
+    tradesRunRef.current = rid
+    setTradesLoading(true)
+    setTradesError(null)
+    fetch(`${BASE}/backtests/${rid}/artifacts/trades.csv`)
+      .then(res => {
+        if (!res.ok) throw new Error(`加载交易明细失败 (${res.status})`)
+        return res.text()
+      })
+      .then(text => {
+        const parsed = parseCsv(text)
+        setTrades(parsed.rows.length > 0 ? parsed : { columns: [], rows: [] })
+      })
+      .catch(err => {
+        setTrades(null)
+        setTradesError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => setTradesLoading(false))
+  }, [run])
 
   const refreshRun = useCallback(async (runId: string) => {
     try {
@@ -214,9 +313,24 @@ function M2BacktestPage() {
     const parsedCash = Number(initCash)
     if (!Number.isFinite(parsedCash) || parsedCash <= 0) { setError('初始资金必须为正数'); return }
 
+    // 表单值 → worker 可校验的类型：checkbox 布尔原样，其余转数字；空值跳过（走默认）
+    const meta = selectedStrategy?.param_meta ?? []
+    const params: Record<string, unknown> = {}
+    for (const m of meta) {
+      const raw = paramValues[m.key]
+      if (raw === undefined || raw === '') continue
+      if (typeof raw === 'boolean') { params[m.key] = raw; continue }
+      const num = Number(raw)
+      if (!Number.isFinite(num)) { setError(`参数「${m.label}」不是有效数字`); return }
+      params[m.key] = num
+    }
+
     setBusy(true)
     setError(null)
     setRun(null)
+    setTrades(null)
+    setTradesError(null)
+    tradesRunRef.current = null
     try {
       const created = await m2Fetch<RunState>('/backtests', {
         method: 'POST',
@@ -226,7 +340,7 @@ function M2BacktestPage() {
           start: toStartIso(startDate),
           end: toEndIso(endDate),
           init_cash: parsedCash,
-          params: {},
+          params,
         }),
       })
       setRun(created)
@@ -236,7 +350,7 @@ function M2BacktestPage() {
     } finally {
       setBusy(false)
     }
-  }, [strategyId, symbol, startDate, endDate, initCash, watchRun])
+  }, [strategyId, symbol, startDate, endDate, initCash, paramValues, selectedStrategy, watchRun])
 
   const cancelBacktest = useCallback(async () => {
     if (!run) return
@@ -252,6 +366,9 @@ function M2BacktestPage() {
     clearTimers()
     setRun(null)
     setError(null)
+    setTrades(null)
+    setTradesError(null)
+    tradesRunRef.current = null
   }, [clearTimers])
 
   const canStart = !busy && !strategiesLoading && !run
@@ -377,6 +494,38 @@ function M2BacktestPage() {
             <p className="text-xs text-muted leading-relaxed">{selectedStrategy.description}</p>
           )}
 
+          {/* 参数表单：按策略返回的 param_meta 自动生成；分组渲染，改了才提交（空值走默认） */}
+          {selectedStrategy?.param_meta && selectedStrategy.param_meta.length > 0 && (() => {
+            const groups = new Map<string, ParamMetaField[]>()
+            for (const m of selectedStrategy.param_meta) {
+              const g = m.group ?? 'core'
+              if (!groups.has(g)) groups.set(g, [])
+              groups.get(g)!.push(m)
+            }
+            return (
+              <div className="space-y-3 border-t border-border pt-3">
+                <div className="text-xs font-medium text-secondary">策略参数</div>
+                {[...groups.entries()].map(([group, fields]) => (
+                  <div key={group} className="space-y-2">
+                    {groups.size > 1 && (
+                      <div className="text-xs text-muted">{GROUP_LABEL[group] ?? group}</div>
+                    )}
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                      {fields.map(m => (
+                        <ParamField
+                          key={m.key}
+                          meta={m}
+                          value={paramValues[m.key]}
+                          onChange={v => setParamValues(prev => ({ ...prev, [m.key]: v }))}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
+
           {error && (
             <div className="rounded-btn border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">{error}</div>
           )}
@@ -441,6 +590,79 @@ function M2BacktestPage() {
               {' · '}权益行数 <span className="text-secondary font-mono">{run.result.equity_rows}</span>
             </div>
 
+            {/* 交易明细：run 完成后自动拉 trades.csv 渲染；前 50 行内联，可展开 */}
+            {run.status === 'completed' && run.artifacts.includes('trades.csv') && (
+              <div className="space-y-2 border-t border-border pt-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-medium text-secondary">交易明细</div>
+                  {trades && trades.rows.length > 0 && (
+                    <span className="text-xs text-muted font-mono">共 {trades.rows.length} 笔</span>
+                  )}
+                </div>
+                {tradesLoading && (
+                  <div className="flex items-center gap-2 text-xs text-muted py-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> 加载交易明细…
+                  </div>
+                )}
+                {tradesError && (
+                  <div className="rounded-btn border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+                    {tradesError}
+                  </div>
+                )}
+                {trades && trades.rows.length === 0 && !tradesLoading && (
+                  <div className="text-xs text-muted py-2">本次回测没有成交记录</div>
+                )}
+                {trades && trades.rows.length > 0 && !tradesLoading && (
+                  <div className="overflow-x-auto rounded-input border border-border">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-border bg-elevated/50">
+                          {trades.columns.map(col => (
+                            <th key={col} className="px-2.5 py-1.5 text-left font-medium text-muted whitespace-nowrap">{col}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {trades.rows
+                          .slice(0, tradesExpanded ? TRADES_EXPAND_LIMIT : TRADES_INLINE_LIMIT)
+                          .map((cells, idx) => (
+                          <tr key={idx} className="border-b border-border/50 last:border-0">
+                            {trades.columns.map((col, ci) => {
+                              const cell = cells[ci] ?? ''
+                              const isDirection = col === 'direction'
+                              const isPnl = col === 't_pnl'
+                              const pnlNum = isPnl ? Number(cell) : NaN
+                              const tone = isDirection
+                                ? /buy|买入/i.test(cell) ? 'text-bull' : /sell|卖出/i.test(cell) ? 'text-bear' : ''
+                                : isPnl && Number.isFinite(pnlNum)
+                                  ? pnlNum > 0 ? 'text-bull' : pnlNum < 0 ? 'text-bear' : ''
+                                  : ''
+                              return (
+                                <td key={ci} className={cn('px-2.5 py-1.5 whitespace-nowrap font-mono', tone)}>
+                                  {isPnl && Number.isFinite(pnlNum) ? pnlNum.toFixed(2) : cell}
+                                </td>
+                              )
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {trades && trades.rows.length > TRADES_INLINE_LIMIT && !tradesLoading && (
+                  <button
+                    type="button"
+                    onClick={() => setTradesExpanded(prev => !prev)}
+                    className="text-xs text-accent hover:underline"
+                  >
+                    {tradesExpanded
+                      ? '收起（最多显示 500 行）'
+                      : `展开更多（已显示前 ${TRADES_INLINE_LIMIT} 行 / 共 ${trades.rows.length} 笔）`}
+                  </button>
+                )}
+              </div>
+            )}
+
             {run.artifacts.length > 0 && (
               <div className="space-y-2">
                 <div className="text-xs font-medium text-secondary">结果文件</div>
@@ -473,6 +695,73 @@ function M2BacktestPage() {
         )}
       </div>
     </>
+  )
+}
+
+/** 参数控件：checkbox 原生勾选框；number/slider 数字输入（带 min/max/step）；select 下拉。 */
+function ParamField({ meta, value, onChange }: {
+  meta: ParamMetaField
+  value: string | boolean | undefined
+  onChange: (v: string | boolean) => void
+}) {
+  const label = (
+    <span className="flex items-center gap-1">
+      {meta.label}
+      {meta.help && (
+        <span className="text-muted normal-case" title={meta.help}>ⓘ</span>
+      )}
+    </span>
+  )
+
+  if (meta.kind === 'checkbox') {
+    return (
+      <label className="flex items-center gap-2 text-xs text-secondary h-9">
+        <input
+          type="checkbox"
+          checked={value === true}
+          onChange={e => onChange(e.target.checked)}
+          className="h-4 w-4 accent-[hsl(var(--accent))]"
+        />
+        {label}
+      </label>
+    )
+  }
+
+  if (meta.kind === 'select' && meta.options && meta.options.length > 0) {
+    return (
+      <label className="flex flex-col gap-1 text-xs text-secondary">
+        {label}
+        <select
+          value={String(value ?? '')}
+          onChange={e => onChange(e.target.value)}
+          className="h-9 rounded-input bg-base border border-border px-2 text-sm text-foreground focus:outline-none focus:border-accent"
+        >
+          {meta.options.map(opt => (
+            <option key={String(opt)} value={String(opt)}>{String(opt)}</option>
+          ))}
+        </select>
+        {meta.help && <span className="text-muted text-[10px] leading-tight">{meta.help}</span>}
+      </label>
+    )
+  }
+
+  // number / slider：数字输入（slider 用 range 步进太粗，小数费率如 0.00008 没法调，统一用输入框）
+  const step = meta.step ?? (Number.isInteger(Number(meta.default)) ? 1 : 0.01)
+  return (
+    <label className="flex flex-col gap-1 text-xs text-secondary">
+      {label}
+      <input
+        type="number"
+        value={String(value ?? '')}
+        onChange={e => onChange(e.target.value)}
+        min={meta.min ?? undefined}
+        max={meta.max ?? undefined}
+        step={step}
+        inputMode="decimal"
+        className="h-9 rounded-input bg-base border border-border px-2 text-sm text-foreground font-mono focus:outline-none focus:border-accent"
+      />
+      {meta.help && <span className="text-muted text-[10px] leading-tight">{meta.help}</span>}
+    </label>
   )
 }
 
