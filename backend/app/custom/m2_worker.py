@@ -143,10 +143,13 @@ def run(request_path: Path, output_dir: Path) -> int:
                           "trades.csv", "rejected.csv", "daily_t.csv"],
         })
         return 0
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "worker_error.log").write_text(traceback.format_exc(), encoding="utf-8")
-        _write_error(output_dir, "WORKER_FAILED", "backtest worker failed")
+        # 必须把异常原文带出去：原来这里只写死一句 "backtest worker failed"，
+        # 真实原因（如"初始资金不足：底仓 1000 股 × 527.00 = 527,000 元"）只在
+        # traceback 里，用户侧只看到一个没有信息量的 WORKER_FAILED。
+        _write_error(output_dir, "WORKER_FAILED", f"{type(exc).__name__}: {exc}")
         return 30
 
 

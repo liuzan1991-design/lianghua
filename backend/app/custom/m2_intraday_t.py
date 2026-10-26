@@ -198,12 +198,38 @@ class M2BacktestService:
                     self._event_locked(record, "completed", 100, "completed")
                     self._save_locked(record)
             else:
-                self._finish_error(record, payload.get("error_code", "WORKER_FAILED"),
-                                   payload.get("message", "backtest worker failed"), "failed")
+                code = payload.get("error_code", "WORKER_FAILED")
+                message = payload.get("message") or "backtest worker failed"
+                # worker_result.json 里的 message 可能是无信息量的兜底句
+                # （旧版 worker 写死 "backtest worker failed"）。
+                # 这种情况从 worker_error.log 的 traceback 末行取真实异常。
+                if code == "WORKER_FAILED" and (
+                        "work failed" in message or not message.strip()):
+                    tail = self._worker_error_tail(run_id)
+                    if tail:
+                        message = tail
+                self._finish_error(record, code, message, "failed")
         finally:
             with self._lock:
                 self._processes.pop(run_id, None)
             self._slots.release()
+
+    def _worker_error_tail(self, run_id: str, max_chars: int = 400) -> str:
+        """从 `worker_error.log` 取 traceback 的最后一行 —— 那就是真正的异常原因。
+
+        取末行而不是全文：全文几十行 Python 调用栈对用户没用，
+        `ValueError: 初始资金不足：...` 这一行才是有用的。
+        """
+        path = self.state_root / run_id / "worker_error.log"
+        if not path.is_file():
+            return ""
+        try:
+            lines = [ln.strip() for ln in
+                     path.read_text(encoding="utf-8", errors="replace").splitlines()
+                     if ln.strip()]
+        except Exception:  # noqa: BLE001
+            return ""
+        return lines[-1][:max_chars] if lines else ""
 
     def _finish_error(self, record: RunRecord, code: str, message: str, status: str) -> None:
         with self._lock:

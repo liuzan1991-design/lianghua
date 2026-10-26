@@ -409,7 +409,13 @@ function M2BacktestPage() {
 
             {run.error_code && (
               <div className="rounded-btn border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
-                错误码 {run.error_code}
+                <div className="font-medium">错误码 {run.error_code}</div>
+                {/* 只给错误码等于没说 —— 把 worker 带回来的真实原因显示出来 */}
+                {run.message && run.message !== 'backtest worker failed' && (
+                  <div className="mt-1 break-words leading-relaxed text-danger/90">
+                    {run.message}
+                  </div>
+                )}
               </div>
             )}
           </section>
