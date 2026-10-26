@@ -313,16 +313,24 @@ function M2BacktestPage() {
     const parsedCash = Number(initCash)
     if (!Number.isFinite(parsedCash) || parsedCash <= 0) { setError('初始资金必须为正数'); return }
 
-    // 表单值 → worker 可校验的类型：checkbox 布尔原样，其余转数字；空值跳过（走默认）
+    // 表单值 → worker 可校验的类型：checkbox 布尔原样、select/text 字符串原样、
+    // number/slider 转数字；空值跳过（走默认）。⚠️ 不能无差别 Number() ——
+    // 「大盘指数」这类 select 的值是 000300.SH，转数字会误报"不是有效数字"。
     const meta = selectedStrategy?.param_meta ?? []
+    const metaByKey = new Map(meta.map(m => [m.key, m]))
     const params: Record<string, unknown> = {}
-    for (const m of meta) {
-      const raw = paramValues[m.key]
-      if (raw === undefined || raw === '') continue
-      if (typeof raw === 'boolean') { params[m.key] = raw; continue }
-      const num = Number(raw)
-      if (!Number.isFinite(num)) { setError(`参数「${m.label}」不是有效数字`); return }
-      params[m.key] = num
+    for (const [key, raw] of Object.entries(paramValues)) {
+      if (raw === '') continue
+      const m = metaByKey.get(key)
+      if (!m) continue
+      if (typeof raw === 'boolean' || m.kind === 'checkbox') { params[key] = raw; continue }
+      if (m.kind === 'number' || m.kind === 'slider') {
+        const num = Number(raw)
+        if (!Number.isFinite(num)) { setError(`参数「${m.label}」不是有效数字`); return }
+        params[key] = num
+        continue
+      }
+      params[key] = raw
     }
 
     setBusy(true)
