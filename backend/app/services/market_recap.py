@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date
+from pathlib import Path
 from typing import AsyncIterator
 
 from app.services.market_overview_builder import build_market_overview
@@ -91,6 +93,28 @@ _SYSTEM_PROMPT = """你是一位拥有 15 年 A 股一线研究经验的市场�
 6. **简明客观**:用读者能扫读的密度输出,总字数 1200-2000 字,重在客观信息密度
 
 现在请基于下方数据进行复盘。"""
+
+
+# ----------------------------------------------------------------
+# 提示词外置: data/recap_prompt.md 存在且非空则优先使用(便于不改代码自定义复盘思路)。
+# 文件头 <!-- ... --> 说明注释会被剥离, 不会喂给模型; 文件缺失/为空/读失败时回退内置默认模板。
+# ----------------------------------------------------------------
+_PROMPT_OVERRIDE_NAME = "recap_prompt.md"
+
+
+def load_system_prompt() -> str:
+    try:
+        from app.config import settings
+
+        path = Path(settings.data_dir) / _PROMPT_OVERRIDE_NAME
+        if path.exists():
+            text = path.read_text(encoding="utf-8").strip()
+            text = re.sub(r"\A<!--.*?-->\s*", "", text, flags=re.DOTALL).strip()
+            if text:
+                return text
+    except Exception:
+        logger.warning("读取自定义复盘提示词失败, 回退内置模板", exc_info=True)
+    return _SYSTEM_PROMPT
 
 
 # ================================================================
@@ -330,7 +354,7 @@ async def recap_market_stream(
         got_content = False
         async for delta in stream_ai_text(
             [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": load_system_prompt()},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
