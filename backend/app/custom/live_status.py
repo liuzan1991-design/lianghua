@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Live 状态扩展（live-status）：quant_app 实盘引擎的**只读**仪表盘。
+"""Live 状态扩展（live-status）：quant_app 实盘引擎的仪表盘 + 实盘口径写入口（H64）。
 
 定位
 ----
-对应 H57 方案（Live接面板与H57_S4_S5_实施方案.md）施工顺序第 1 步：
-纯新增文件，零改 quant_app，零写接口 —— 面板红线是**绝不提供 live_config 的写入口**，
-所有数据直读 quant_app 的 live_outputs/ 与 data/live/ 产物文件。
+状态页（心跳/观察单元/生效配置）仍是**只读**；2026-10-28 用户明确要求"能自己随时
+调整实盘口径"，故新增 `POST /config` 写入口（H64），但带三道护栏：值域校验、
+**可行性校验**（按最新价算底仓，<100 股直接拒绝）、写前备份 + `config_audit.jsonl` 留痕。
+⚠️ 原红线（H57 方案"绝不提供写入口"）自此**作废**，改为"可写但必须可追溯、且次日生效"。
 
 数据源（全部 quant_app 生产产物，只读）
 --------------------------------------
@@ -161,7 +162,203 @@ def config_view() -> dict:
                 audit.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return {"config_applied": applied, "audit_tail": audit}
+    return {"config_applied": applied, "audit_tail": audit,
+            "editable": _editable_view()}
+
+
+# ── H64：实盘口径的**写入口**（2026-10-28 用户授权） ────────────────────────
+# 原红线是"面板绝不提供 live_config 写入口"（H57 方案，S5 未落地前）。
+# 用户 2026-10-28 明确要求"能自己随时调整"，故开写口，但必须带三道护栏：
+#   ① 值域校验；② **可行性校验**（按最新价算 base_position，<100 股直接拒绝）；
+#   ③ 写前备份 + config_audit.jsonl 留痕，并且明示"次日启动才生效"。
+_CFG_PATH = ENGINE_ROOT / "data" / "live_config.json"
+_AUDIT_PATH = _LIVE_DIR / "config_audit.jsonl"
+
+_RISK_SPEC = {
+    "max_symbol_position_pct": (0.05, 0.50, "单标的上限"),
+    "max_order_value_pct": (0.02, 0.50, "单笔委托上限"),
+    "max_daily_loss_pct": (0.005, 0.20, "日内亏损上限"),
+    "max_symbol_cumulative_loss_pct": (0.02, 0.50, "单标的累计亏损上限"),
+    "max_account_position_pct": (0.10, 1.00, "账户总仓位上限"),
+}
+
+
+def _trade_start() -> str:
+    """从 live_match_loop.py 读 TRADE_START_DATE（避免在本文件里重复一份而漂移）。"""
+    try:
+        import re as _re
+        txt = (ENGINE_ROOT / "live_match_loop.py").read_text(encoding="utf-8", errors="replace")
+        m = _re.search(r'TRADE_START_DATE\s*=\s*pd\.Timestamp\("([\d-]+)"\)', txt)
+        if m:
+            return m.group(1)
+    except Exception:  # noqa: BLE001
+        pass
+    return "2026-09-07"
+
+
+def _price_at_trade_start(code: str) -> float | None:
+    """引擎冻结参数用的价格 = **TRADE_START_DATE 起首个 close**（不是最新价！）。
+
+    2026-10-28 踩过：面板按最新价 263.63 判"能买 100 股"，引擎按起点价 358.00 算
+    只有 83 股 ⇒ 整百 0 股 ⇒ 启动直接抛"仓位不足100股"。校验口径必须与执行口径一致。
+    """
+    start = _trade_start()
+    for p in (ENGINE_ROOT / "data" / "live" / f"stock_{code}_1m.csv",
+              ENGINE_ROOT / "data" / f"stock_{code}_1m.csv"):
+        try:
+            if not p.is_file():
+                continue
+            with p.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.readline()                     # 表头
+                for line in fh:
+                    parts = line.split(",")
+                    if len(parts) >= 5 and parts[0][:10] >= start:
+                        return float(parts[4])    # close
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _latest_price(code: str) -> float | None:
+    """取最新价：优先 live 文件末根，其次历史 CSV 末根（都是 quant_app 产物）。"""
+    for p in (ENGINE_ROOT / "data" / "live" / f"stock_{code}_1m.csv",
+              ENGINE_ROOT / "data" / f"stock_{code}_1m.csv"):
+        try:
+            if p.is_file():
+                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+                if len(lines) > 1:
+                    return float(lines[-1].split(",")[4])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _editable_view() -> dict:
+    """当前磁盘配置 + 每个标的的可行性预判（供界面实时提示）。"""
+    raw = _read_json(_CFG_PATH) or {}
+    cash = raw.get("initial_cash")
+    risk_pct = raw.get("risk_pct", 0.10)
+    risk = dict(raw.get("risk") or {})
+    positions = raw.get("positions") or []
+    checks = []
+    for pos in positions:
+        if not pos.get("enabled", True):
+            continue
+        code = str(pos.get("code") or "")
+        px = _price_at_trade_start(code) or _latest_price(code)  # 与引擎冻结口径一致
+        base = None
+        if px and cash:
+            base = int((float(cash) * float(risk_pct)) / px) // 100 * 100
+        checks.append({
+            "code": code, "strategy_id": pos.get("strategy_id"),
+            "price": px, "base_position": base,
+            "ok": (base is not None and base >= 100),
+            "lota_pct": (round(px * 100 / float(cash), 4) if (px and cash) else None),
+        })
+    return {
+        "path": str(_CFG_PATH),
+        "exists": _CFG_PATH.is_file(),
+        "current": {"initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
+                    "positions": positions},
+        "risk_spec": {k: {"min": v[0], "max": v[1], "label": v[2]}
+                      for k, v in _RISK_SPEC.items()},
+        "position_checks": checks,
+        "takes_effect": "次日 04:30 启动时生效（运行中进程不热改）",
+    }
+
+
+@router.post("/config")
+def config_save(payload: dict) -> dict:
+    """保存实盘口径（H64）。校验不过**一律拒绝**，绝不静默截断。"""
+    raw = _read_json(_CFG_PATH) or {"version": 1, "positions": []}
+    errs: list[str] = []
+
+    cash = payload.get("initial_cash", raw.get("initial_cash"))
+    if cash is None:
+        errs.append("initial_cash 必须填写（实盘资金基准）")
+    else:
+        cash = float(cash)
+        if not (50_000 <= cash <= 10_000_000):
+            errs.append(f"initial_cash={cash:,.0f} 超出允许区间 [50,000, 10,000,000]")
+
+    risk_pct = float(payload.get("risk_pct", raw.get("risk_pct", 0.10)))
+    if not (0.02 <= risk_pct <= 0.50):
+        errs.append(f"risk_pct={risk_pct} 超出 [0.02, 0.50]")
+
+    risk = dict(raw.get("risk") or {})
+    for k, v in dict(payload.get("risk") or {}).items():
+        if k not in _RISK_SPEC:
+            errs.append(f"未知风控字段：{k}")
+            continue
+        lo, hi, label = _RISK_SPEC[k]
+        v = float(v)
+        if not (lo <= v <= hi):
+            errs.append(f"{label}({k})={v} 超出 [{lo}, {hi}]")
+        risk[k] = v
+
+    positions = payload.get("positions", raw.get("positions") or [])
+    # 可行性：按**最新价**算底仓，<100 股直接拒绝（30 万 × 10% ÷ 577 = 0 股就是这个坑）
+    _checked: set[str] = set()      # 同一 code 多个策略只报一次
+    for pos in positions:
+        if not pos.get("enabled", True):
+            continue
+        code = str(pos.get("code") or "")
+        if code in _checked:
+            continue
+        _checked.add(code)
+        px = _price_at_trade_start(code) or _latest_price(code)  # 与引擎冻结口径一致
+        if px is None:
+            errs.append(f"{code}: 拿不到最新价，无法校验 1 手是否买得起")
+            continue
+        base = int((cash * risk_pct) / px) // 100 * 100
+        if base < 100:
+            need = int(px * 100)
+            errs.append(
+                f"{code}: {cash:,.0f}×{risk_pct:.0%}={cash * risk_pct:,.0f} 元，"
+                f"按引擎冻结价(09-07起) {px:.2f} 只够 {base} 股（1 手需 {need:,} 元）"
+                f"⇒ 请提高资金/比例或换更便宜的标的")
+
+    if errs:
+        return {"ok": False, "errors": errs}
+
+    new_cfg = dict(raw)
+    new_cfg.update({"version": raw.get("version", 1),
+                    "initial_cash": cash, "risk_pct": risk_pct,
+                    "risk": risk, "positions": positions})
+    new_cfg["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    # 写前备份（保留最近 5 份）
+    try:
+        if _CFG_PATH.is_file():
+            bak_dir = _CFG_PATH.parent / "_config_backup"
+            bak_dir.mkdir(parents=True, exist_ok=True)
+            bak = bak_dir / f"live_config_{datetime.now():%Y%m%d_%H%M%S}.json"
+            bak.write_text(_CFG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+            olds = sorted(bak_dir.glob("live_config_*.json"))[:-5]
+            for old in olds:
+                old.unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "errors": [f"备份旧配置失败，已中止写入：{e!r}"]}
+
+    tmp = _CFG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(new_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, _CFG_PATH)
+
+    try:
+        _AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _AUDIT_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "source": "tickflow-panel",
+                "initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
+                "positions": [f"{p.get('code')}×{p.get('strategy_id')}" for p in positions],
+            }, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — 审计写失败不回滚配置，但要在返回里说明
+        return {"ok": True, "warning": "配置已保存，但审计日志写入失败",
+                "takes_effect": "次日 04:30 启动时生效", "path": str(_CFG_PATH)}
+
+    return {"ok": True, "takes_effect": "次日 04:30 启动时生效（运行中进程不热改）",
+            "path": str(_CFG_PATH)}
 
 
 def setup(registrar: BackendExtensionRegistrar) -> None:

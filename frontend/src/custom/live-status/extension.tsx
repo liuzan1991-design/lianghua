@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Activity, AlertTriangle, RefreshCw } from 'lucide-react'
 import type { FrontendExtension } from '@/extensions/types'
 import { PageHeader } from '@/components/PageHeader'
@@ -7,11 +7,29 @@ import { cn } from '@/lib/cn'
 /**
  * Live 状态页 —— 对接后端 `app/custom/live_status.py`（/api/custom/live-status）。
  *
- * 定位：**纯只读仪表盘**。展示 quant_app 实盘引擎的心跳 / 观察单元 / 生效配置。
- * 红线（H57 方案）：本页无任何写按钮；live_config 的写入口在 S5 全部落地并验证前不存在。
+ * 定位：仪表盘 + **实盘口径编辑**（H64，2026-10-28 用户授权）。
+ * 状态区仍然只读；写入口只有一块「实盘口径」，且保存后**次日 04:30 启动才生效**，
+ * 写入前由后端做值域 + 可行性校验（按引擎冻结价算底仓，<100 股直接拒绝）。
  */
 
 const BASE = '/api/custom/live-status'
+
+interface Editable {
+  path: string
+  exists: boolean
+  current: {
+    initial_cash: number | null
+    risk_pct: number
+    risk: Record<string, number>
+    positions: { code: string; strategy_id: string; enabled?: boolean }[]
+  }
+  risk_spec: Record<string, { min: number; max: number; label: string }>
+  position_checks: {
+    code: string; strategy_id: string; price: number | null
+    base_position: number | null; ok: boolean; lota_pct: number | null
+  }[]
+  takes_effect: string
+}
 
 interface Heartbeat {
   date?: string
@@ -119,6 +137,12 @@ function BreakerBadge({ state }: { state?: string }) {
 function LiveStatusPage() {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [units, setUnits] = useState<Unit[]>([])
+  const [editable, setEditable] = useState<Editable | null>(null)
+  const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '' })
+  const [saving, setSaving] = useState(false)
+  const [saveMsg, setSaveMsg] = useState<string | null>(null)
+  const [saveErrs, setSaveErrs] = useState<string[]>([])
+  const touchedRef = useRef(false)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [updatedAt, setUpdatedAt] = useState<string>('')
@@ -126,12 +150,23 @@ function LiveStatusPage() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [s, u] = await Promise.all([
+      const [s, u, c] = await Promise.all([
         fetch(`${BASE}/summary`).then(r => { if (!r.ok) throw new Error(`summary ${r.status}`); return r.json() as Promise<Summary> }),
         fetch(`${BASE}/units`).then(r => { if (!r.ok) throw new Error(`units ${r.status}`); return r.json() as Promise<{ units: Unit[] }> }),
+        fetch(`${BASE}/config`).then(r => { if (!r.ok) throw new Error(`config ${r.status}`); return r.json() as Promise<{ editable: Editable }> }),
       ])
       setSummary(s)
       setUnits(u.units)
+      setEditable(c.editable)
+      // 用户正在编辑时不要被 30 秒轮询覆盖（用 ref 判断，避免在 setState 里再 setState）
+      if (!touchedRef.current) {
+        setForm({
+          cash: String(c.editable?.current?.initial_cash ?? ''),
+          riskPct: ((c.editable?.current?.risk_pct ?? 0.1) * 100).toFixed(1),
+          capPct: ((c.editable?.current?.risk?.max_symbol_position_pct ?? 0.2) * 100).toFixed(1),
+          orderPct: ((c.editable?.current?.risk?.max_order_value_pct ?? 0.1) * 100).toFixed(1),
+        })
+      }
       setError(null)
       setUpdatedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }))
     } catch (err) {
@@ -140,6 +175,37 @@ function LiveStatusPage() {
       setLoading(false)
     }
   }, [])
+
+  const save = useCallback(async () => {
+    setSaving(true); setSaveMsg(null); setSaveErrs([])
+    try {
+      const body = {
+        initial_cash: Number(form.cash),
+        risk_pct: Number(form.riskPct) / 100,
+        risk: {
+          max_symbol_position_pct: Number(form.capPct) / 100,
+          max_order_value_pct: Number(form.orderPct) / 100,
+        },
+      }
+      const r = await fetch(`${BASE}/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const d = await r.json() as { ok: boolean; errors?: string[]; takes_effect?: string; warning?: string }
+      if (d.ok) {
+        setSaveMsg(`已保存 · ${d.takes_effect ?? '次日启动生效'}${d.warning ? ` · ⚠️ ${d.warning}` : ''}`)
+        touchedRef.current = false
+        load()
+      } else {
+        setSaveErrs(d.errors ?? ['保存失败（后端未返回原因）'])
+      }
+    } catch (err) {
+      setSaveErrs([err instanceof Error ? err.message : String(err)])
+    } finally {
+      setSaving(false)
+    }
+  }, [form, load])
 
   useEffect(() => {
     load()
@@ -156,7 +222,7 @@ function LiveStatusPage() {
     <div className="mx-auto w-full max-w-5xl space-y-4 p-4 pb-10">
       <PageHeader
         title="Live 状态"
-        subtitle="quant_app 实盘引擎只读仪表盘 · 无写入口"
+        subtitle="实盘引擎仪表盘 · 实盘口径可调（次日生效）"
       />
 
       <div className="flex items-center justify-between text-xs text-muted">
@@ -272,6 +338,74 @@ function LiveStatusPage() {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </Card>
+
+      {/* ── 实盘口径（可编辑，H64） ── */}
+      <Card title="实盘口径（可调整 · 次日生效）">
+        {!editable && <div className="text-xs text-muted">读取失败，或 quant_app 配置层不可用。</div>}
+        {editable && (
+          <div className="space-y-3">
+            <div className="text-[11px] text-muted">
+              标的：
+              {editable.current.positions.filter(p => p.enabled !== false)
+                .map(p => `${p.code}×${p.strategy_id}`).join('、') || '（空）'}
+              {editable.position_checks.length > 0 && (
+                <span>
+                  {' '}· 引擎冻结价 {editable.position_checks[0].price ?? '—'} 元 → 底仓{' '}
+                  {editable.position_checks[0].base_position ?? '—'} 股
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              {([
+                ['cash', '资金基准(元)', '10000'],
+                ['riskPct', '底仓比例(%)', '0.5'],
+                ['capPct', '单标的上限(%)', '1'],
+                ['orderPct', '单笔上限(%)', '1'],
+              ] as const).map(([k, label, step]) => (
+                <label key={k} className="block">
+                  <span className="mb-1 block text-[11px] text-muted">{label}</span>
+                  <input
+                    type="number"
+                    step={step}
+                    value={form[k]}
+                    onChange={e => {
+                      touchedRef.current = true
+                      setForm(prev => ({ ...prev, [k]: e.target.value }))
+                    }}
+                    className="w-full rounded-btn border border-border bg-base px-2 py-1 text-xs"
+                  />
+                </label>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={save}
+                disabled={saving}
+                className="rounded-btn border border-border px-3 py-1 text-xs hover:bg-base disabled:opacity-50"
+              >
+                {saving ? '保存中…' : '保存（次日 04:30 生效）'}
+              </button>
+              <span className="text-[11px] text-muted">{editable.takes_effect}</span>
+            </div>
+
+            {saveMsg && (
+              <div className="rounded-btn border border-border px-2 py-1 text-[11px]">{saveMsg}</div>
+            )}
+            {saveErrs.length > 0 && (
+              <ul className="space-y-1 rounded-btn border border-bear/40 bg-bear/10 px-2 py-1 text-[11px] text-bear">
+                {saveErrs.map((e, i) => <li key={i}>· {e}</li>)}
+              </ul>
+            )}
+            <div className="text-[11px] text-muted">
+              校验用的是「引擎冻结价」（TRADE_START_DATE 起首个收盘），不是最新价 ——
+              两者差距大时能拦住“面板放行、引擎启动即报错”。
+            </div>
           </div>
         )}
       </Card>
