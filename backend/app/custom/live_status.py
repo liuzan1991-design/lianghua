@@ -346,7 +346,8 @@ def _editable_view() -> dict:
         "exists": _CFG_PATH.is_file(),
         "current": {"initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
                     "positions": positions,
-                    "paper_start_date": raw.get("paper_start_date")},
+                    "paper_start_date": raw.get("paper_start_date"),
+                    "kline_source": raw.get("kline_source") or "qmt"},
         # 引擎实际用的起点（含兜底常量）—— 面板必须显示这个，否则用户以为改了却没用上
         "paper_start_effective": _trade_start(),
         "risk_spec": {k: {"min": v[0], "max": v[1], "label": v[2]}
@@ -375,6 +376,11 @@ def config_save(payload: dict) -> dict:
     risk_pct = float(payload.get("risk_pct", raw.get("risk_pct", 0.10)))
     if not (0.02 <= risk_pct <= 0.50):
         errs.append(f"risk_pct={risk_pct} 超出 [0.02, 0.50]")
+
+    # 行情主源（H72）：ad = 星耀 / qmt = 迅投（失败自动回退 AD）/ stockdb = 本地库
+    ksrc = str(payload.get("kline_source", raw.get("kline_source") or "qmt")).strip().lower()
+    if ksrc not in ("ad", "qmt", "stockdb"):
+        errs.append(f"kline_source 只能是 ad / qmt / stockdb，收到 {ksrc!r}")
 
     # 纸面起点（H67）：留空 = 回落引擎常量；填了必须是 YYYY-MM-DD 且不在未来
     psd_raw = payload.get("paper_start_date", raw.get("paper_start_date"))
@@ -482,7 +488,7 @@ def config_save(payload: dict) -> dict:
     new_cfg.update({"version": raw.get("version", 1),
                     "initial_cash": cash, "risk_pct": risk_pct,
                     "risk": risk, "positions": positions,
-                    "paper_start_date": psd})
+                    "paper_start_date": psd, "kline_source": ksrc})
     new_cfg["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     # 写前备份（保留最近 5 份）
@@ -509,7 +515,7 @@ def config_save(payload: dict) -> dict:
                 "at": datetime.now().isoformat(timespec="seconds"),
                 "source": "tickflow-panel",
                 "initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
-                "paper_start_date": psd,
+                "paper_start_date": psd, "kline_source": ksrc,
                 "positions": [f"{p.get('code')}×{p.get('strategy_id')}" for p in positions],
             }, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001 — 审计写失败不回滚配置，但要在返回里说明

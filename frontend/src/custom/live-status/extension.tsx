@@ -41,6 +41,7 @@ interface Editable {
       param_overrides?: Record<string, unknown>
     }[]
     paper_start_date?: string | null
+    kline_source?: string
   }
   /** 引擎实际使用的起点（含兜底常量），面板必须显示这个而不是用户填的值 */
   paper_start_effective?: string
@@ -248,7 +249,7 @@ function LiveStatusPage() {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [units, setUnits] = useState<Unit[]>([])
   const [editable, setEditable] = useState<Editable | null>(null)
-  const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '', startDate: '' })
+  const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '', startDate: '', klineSrc: 'qmt' })
   const [rows, setRows] = useState<{
     code: string; strategy_id: string; enabled: boolean
     param_overrides: Record<string, unknown>
@@ -282,6 +283,7 @@ function LiveStatusPage() {
           capPct: ((c.editable?.current?.risk?.max_symbol_position_pct ?? 0.2) * 100).toFixed(1),
           orderPct: ((c.editable?.current?.risk?.max_order_value_pct ?? 0.1) * 100).toFixed(1),
           startDate: String(c.editable?.current?.paper_start_date ?? ''),
+          klineSrc: String(c.editable?.current?.kline_source ?? 'qmt'),
         })
         setRows((c.editable?.current?.positions ?? []).map(p => ({
           code: p.code, strategy_id: p.strategy_id, enabled: p.enabled !== false,
@@ -303,6 +305,7 @@ function LiveStatusPage() {
       const body = {
         initial_cash: Number(form.cash),
         paper_start_date: form.startDate.trim() || null,
+        kline_source: form.klineSrc,
         risk_pct: Number(form.riskPct) / 100,
         risk: {
           max_symbol_position_pct: Number(form.capPct) / 100,
@@ -594,8 +597,22 @@ function LiveStatusPage() {
               ))}
             </div>
 
-            {/* 纸面交易起点（H67）：留空 = 用常量兜底 */}
+            {/* 行情主源 + 纸面交易起点（H72 / H67） */}
             <div className="flex flex-wrap items-end gap-3 rounded-btn border border-border/50 p-2">
+              <label className="block">
+                <span className="mb-1 block text-[11px] text-muted">行情主源</span>
+                <select
+                  value={form.klineSrc}
+                  onChange={e => {
+                    touchedRef.current = true
+                    setForm(prev => ({ ...prev, klineSrc: e.target.value }))
+                  }}
+                  className="rounded-btn border border-border bg-base px-2 py-1 text-xs"
+                >
+                  <option value="qmt">QMT（失败自动回退 AD）</option>
+                  <option value="ad">AD 星耀</option>
+                </select>
+              </label>
               <label className="block">
                 <span className="mb-1 block text-[11px] text-muted">纸面交易起点</span>
                 <input
