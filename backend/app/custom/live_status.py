@@ -288,6 +288,7 @@ def _latest_price(code: str) -> float | None:
 _DERIVED_PARAMS = {
     "grid_trade": {"base_position", "trade_shares", "max_position"},
     "intraday_t": {"base_position", "fixed_shares", "max_position"},
+    "sentiment_t": {"base_position", "fixed_shares", "max_position"},   # H71：与 intraday_t 同构
     "ma_swing": {"position_pct"},
 }
 
