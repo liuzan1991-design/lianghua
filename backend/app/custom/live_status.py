@@ -268,6 +268,43 @@ def _latest_price(code: str) -> float | None:
     return None
 
 
+# ── H66：逐策略参数（param_meta）────────────────────────────────────────
+# 由 `freeze_params` 按「资金基准 × 底仓比例 ÷ 冻结价」自动算出的字段：
+# 界面只读展示、**不接受 override** —— 否则同一个数有两个来源，必然打架
+# （§6.9 第 11 形态的反向：机制存在，但被更高优先级的覆盖值悄悄改掉）。
+_DERIVED_PARAMS = {
+    "grid_trade": {"base_position", "trade_shares", "max_position"},
+    "intraday_t": {"base_position", "fixed_shares", "max_position"},
+    "ma_swing": {"position_pct"},
+}
+
+
+def _live_param_meta() -> dict[str, Any]:
+    """live 支持策略的 param_meta（借 quant_app 解释器读，进程内缓存）。
+
+    tickflow 主进程 venv 没有 pandas，不能直接 import strategies ⇒ 复用
+    `m2_intraday_t.strategy_meta()`（Anaconda 子进程 + JSON 落盘 + 缓存）。
+    读不到就返回空 dict：界面退化为「只有全局口径」可用，不阻塞保存。
+    """
+    try:
+        from app.custom.m2_intraday_t import strategy_meta
+        full = strategy_meta(ENGINE_ROOT) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, Any] = {}
+    for s in _supported_strategies():
+        meta = full.get(s["id"])
+        if not meta:
+            continue
+        derived = _DERIVED_PARAMS.get(s["id"], set())
+        out[s["id"]] = {
+            "name": meta.get("name") or s["label"],
+            "param_meta": [dict(m, derived=(m.get("key") in derived))
+                           for m in (meta.get("param_meta") or [])],
+        }
+    return out
+
+
 def _editable_view() -> dict:
     """当前磁盘配置 + 每个标的的可行性预判（供界面实时提示）。"""
     raw = _read_json(_CFG_PATH) or {}
@@ -299,6 +336,7 @@ def _editable_view() -> dict:
                       for k, v in _RISK_SPEC.items()},
         "position_checks": checks,
         "strategies": _supported_strategies(),
+        "strategy_params": _live_param_meta(),
         "takes_effect": "次日 04:30 启动时生效（运行中进程不热改）",
     }
 
@@ -342,6 +380,50 @@ def config_save(payload: dict) -> dict:
             errs.append(f"代码格式不对：{_code!r}（应为 6 位数字）")
         if _sid not in _supported:
             errs.append(f"策略 {_sid!r} 不在 live 支持列表 {sorted(_supported)}")
+
+    # 逐策略参数覆盖校验（H66）：key 必须存在、不许改自动算字段、值要过 kind/值域。
+    # 不做这一步的后果：`params.update(ov)` 会把垃圾 key 直接塞进策略参数并**静默生效**。
+    _pm = _live_param_meta()
+    for pos in positions:
+        _sid = str(pos.get("strategy_id") or "")
+        ov = pos.get("param_overrides") or {}
+        if not isinstance(ov, dict):
+            errs.append(f"{pos.get('code')}×{_sid}: param_overrides 必须是对象")
+            continue
+        if not ov:
+            continue
+        _meta = (_pm.get(_sid) or {}).get("param_meta") or []
+        if not _meta:
+            errs.append(f"{_sid}: 读不到参数元数据，无法校验覆盖值（本次已拒绝，请重试）")
+            continue
+        _by_key = {m["key"]: m for m in _meta}
+        for _k, _v in ov.items():
+            _m = _by_key.get(_k)
+            if _m is None:
+                errs.append(f"{_sid}: 未知参数 {_k!r}（不在 param_meta 内）")
+                continue
+            if _m.get("derived"):
+                errs.append(f"{_sid}.{_k} 由「资金基准×底仓比例」自动算出，不接受手填覆盖")
+                continue
+            _kind = _m.get("kind")
+            if _kind == "checkbox":
+                if not isinstance(_v, bool):
+                    errs.append(f"{_sid}.{_k} 应为布尔值，收到 {_v!r}")
+            elif _kind in ("number", "slider"):
+                try:
+                    _fv = float(_v)
+                except (TypeError, ValueError):
+                    errs.append(f"{_sid}.{_k} 应为数字，收到 {_v!r}")
+                    continue
+                _lo, _hi = _m.get("min"), _m.get("max")
+                if _lo is not None and _fv < float(_lo):
+                    errs.append(f"{_sid}.{_k}={_fv} 小于下限 {_lo}")
+                if _hi is not None and _fv > float(_hi):
+                    errs.append(f"{_sid}.{_k}={_fv} 大于上限 {_hi}")
+            elif _kind == "select":
+                _opts = _m.get("options") or []
+                if _opts and _v not in _opts:
+                    errs.append(f"{_sid}.{_k}={_v!r} 不在可选项 {_opts}")
     # 可行性：按**引擎冻结价**算底仓，<100 股直接拒绝（30 万 × 12% ÷ 358 = 100 股才勉强可行）
     _checked: set[str] = set()      # 同一 code 多个策略只报一次
     for pos in positions:

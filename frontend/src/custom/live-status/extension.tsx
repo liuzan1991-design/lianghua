@@ -14,6 +14,21 @@ import { cn } from '@/lib/cn'
 
 const BASE = '/api/custom/live-status'
 
+interface ParamMeta {
+  key: string
+  label: string
+  default: number | string | boolean | null
+  kind: 'number' | 'slider' | 'checkbox' | 'select' | 'text'
+  min?: number | null
+  max?: number | null
+  step?: number | null
+  options?: string[] | null
+  help?: string | null
+  group?: string | null
+  /** true = 由「资金基准 × 底仓比例」自动算出，界面只读 */
+  derived?: boolean
+}
+
 interface Editable {
   path: string
   exists: boolean
@@ -21,7 +36,10 @@ interface Editable {
     initial_cash: number | null
     risk_pct: number
     risk: Record<string, number>
-    positions: { code: string; strategy_id: string; enabled?: boolean }[]
+    positions: {
+      code: string; strategy_id: string; enabled?: boolean
+      param_overrides?: Record<string, unknown>
+    }[]
   }
   risk_spec: Record<string, { min: number; max: number; label: string }>
   position_checks: {
@@ -29,6 +47,8 @@ interface Editable {
     base_position: number | null; ok: boolean; lota_pct: number | null
   }[]
   strategies: { id: string; label: string }[]
+  /** 逐策略参数元数据（H66）：key/label/kind/min/max/options/group/derived */
+  strategy_params?: Record<string, { name: string; param_meta: ParamMeta[] }>
   takes_effect: string
 }
 
@@ -135,12 +155,103 @@ function BreakerBadge({ state }: { state?: string }) {
   return <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-mono font-medium', tone)}>{s}</span>
 }
 
+/** 逐策略参数编辑器（H66）：按 param_meta 的 group 分组渲染，只写入与默认值不同的项。 */
+function ParamEditor({ meta, value, onChange }: {
+  meta: ParamMeta[]
+  value: Record<string, unknown>
+  onChange: (next: Record<string, unknown>) => void
+}) {
+  const GROUP_LABEL: Record<string, string> = { core: '核心', risk: '风控', cost: '成本' }
+  const groups: Record<string, ParamMeta[]> = {}
+  for (const m of meta) {
+    const g = m.group || 'other'
+    if (!groups[g]) groups[g] = []
+    groups[g].push(m)
+  }
+
+  const setOne = (m: ParamMeta, raw: string | boolean) => {
+    const next = { ...value }
+    let v: unknown = raw
+    if (m.kind === 'checkbox') {
+      v = Boolean(raw)
+    } else if (m.kind === 'number' || m.kind === 'slider') {
+      const n = Number(raw)
+      if (Number.isNaN(n)) return
+      v = n
+    }
+    // 与默认值相同 ⇒ 不写入覆盖（配置保持精简，避免无意义的 diff 与审计噪音）
+    if (v === m.default) delete next[m.key]
+    else next[m.key] = v
+    onChange(next)
+  }
+
+  if (!meta.length) {
+    return <div className="text-[11px] text-muted">读不到该策略的参数元数据（quant_app 侧不可达）。</div>
+  }
+
+  return (
+    <div className="space-y-2 border-t border-border/50 pt-2">
+      {Object.entries(groups).map(([g, items]) => (
+        <div key={g} className="space-y-1">
+          <div className="text-[10px] uppercase tracking-wide text-muted">{GROUP_LABEL[g] ?? g}</div>
+          <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
+            {items.map(m => {
+              const cur = value[m.key] ?? m.default
+              return (
+                <label key={m.key} className="flex items-center justify-between gap-2 text-[11px]">
+                  <span className="text-muted" title={m.help ?? ''}>
+                    {m.label}
+                    {m.derived && <span className="ml-1 text-[9px] text-amber-500">自动</span>}
+                  </span>
+                  {m.derived ? (
+                    <span className="font-mono text-[11px] text-muted/70">按资金算出</span>
+                  ) : m.kind === 'checkbox' ? (
+                    <input
+                      type="checkbox"
+                      checked={Boolean(cur)}
+                      onChange={e => setOne(m, e.target.checked)}
+                      className="accent-[hsl(var(--accent))]"
+                    />
+                  ) : m.kind === 'select' ? (
+                    <select
+                      value={String(cur ?? '')}
+                      onChange={e => setOne(m, e.target.value)}
+                      className="w-32 rounded-btn border border-border bg-base px-1.5 py-0.5 text-[11px]"
+                    >
+                      {(m.options ?? []).map(o => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                  ) : (
+                    <input
+                      type="number"
+                      value={String(cur ?? '')}
+                      min={m.min ?? undefined}
+                      max={m.max ?? undefined}
+                      step={m.step ?? 'any'}
+                      onChange={e => setOne(m, e.target.value)}
+                      className="w-24 rounded-btn border border-border bg-base px-1.5 py-0.5 text-right font-mono text-[11px]"
+                    />
+                  )}
+                </label>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function LiveStatusPage() {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [units, setUnits] = useState<Unit[]>([])
   const [editable, setEditable] = useState<Editable | null>(null)
   const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '' })
-  const [rows, setRows] = useState<{ code: string; strategy_id: string; enabled: boolean }[]>([])
+  const [rows, setRows] = useState<{
+    code: string; strategy_id: string; enabled: boolean
+    param_overrides: Record<string, unknown>
+  }[]>([])
+  /** 展开参数编辑区的行索引（默认收起，避免 52 个参数一次铺满） */
+  const [openParams, setOpenParams] = useState<Record<number, boolean>>({})
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState<string | null>(null)
   const [saveErrs, setSaveErrs] = useState<string[]>([])
@@ -170,6 +281,7 @@ function LiveStatusPage() {
         })
         setRows((c.editable?.current?.positions ?? []).map(p => ({
           code: p.code, strategy_id: p.strategy_id, enabled: p.enabled !== false,
+          param_overrides: (p.param_overrides ?? {}) as Record<string, unknown>,
         })))
       }
       setError(null)
@@ -193,7 +305,7 @@ function LiveStatusPage() {
         },
         positions: rows.map(r => ({
           code: r.code.trim(), strategy_id: r.strategy_id,
-          enabled: r.enabled, param_overrides: {}, note: '',
+          enabled: r.enabled, param_overrides: r.param_overrides, note: '',
         })),
       }
       const r = await fetch(`${BASE}/config`, {
@@ -371,8 +483,12 @@ function LiveStatusPage() {
             {/* 标的 × 策略（可增删） */}
             <div className="space-y-2">
               <div className="text-[11px] text-muted">标的 × 策略（可增删；同一标的可挂多个策略）</div>
-              {rows.map((r, i) => (
-                <div key={i} className="flex flex-wrap items-center gap-2">
+              {rows.map((r, i) => {
+                const meta = editable.strategy_params?.[r.strategy_id]?.param_meta ?? []
+                const nOv = Object.keys(r.param_overrides ?? {}).length
+                return (
+                <div key={i} className="space-y-2 rounded-btn border border-border/50 p-2">
+                  <div className="flex flex-wrap items-center gap-2">
                   <input
                     value={r.code}
                     placeholder="6 位代码"
@@ -416,14 +532,33 @@ function LiveStatusPage() {
                   >
                     删除
                   </button>
+                    <button
+                      type="button"
+                      onClick={() => setOpenParams(p => ({ ...p, [i]: !p[i] }))}
+                      className="rounded-btn border border-border px-2 py-1 text-[11px] hover:bg-base"
+                    >
+                      参数{nOv ? ` · 已改 ${nOv} 项` : ''} {openParams[i] ? '▾' : '▸'}
+                    </button>
+                  </div>
+                  {openParams[i] && (
+                    <ParamEditor
+                      meta={meta}
+                      value={r.param_overrides ?? {}}
+                      onChange={next => {
+                        touchedRef.current = true
+                        setRows(prev => prev.map((x, j) => (j === i ? { ...x, param_overrides: next } : x)))
+                      }}
+                    />
+                  )}
                 </div>
-              ))}
+                )
+              })}
               <button
                 type="button"
                 onClick={() => {
                   touchedRef.current = true
                   const first = editable.strategies?.[0]?.id ?? 'grid_trade'
-                  setRows(prev => [...prev, { code: '', strategy_id: first, enabled: true }])
+                  setRows(prev => [...prev, { code: '', strategy_id: first, enabled: true, param_overrides: {} }])
                 }}
                 className="rounded-btn border border-border px-2 py-1 text-[11px] hover:bg-base"
               >
