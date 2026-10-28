@@ -42,6 +42,7 @@ interface Editable {
     }[]
     paper_start_date?: string | null
     kline_source?: string
+    cross_symbol_cap?: number | null
   }
   /** 引擎实际使用的起点（含兜底常量），面板必须显示这个而不是用户填的值 */
   paper_start_effective?: string
@@ -249,7 +250,7 @@ function LiveStatusPage() {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [units, setUnits] = useState<Unit[]>([])
   const [editable, setEditable] = useState<Editable | null>(null)
-  const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '', startDate: '', klineSrc: 'qmt' })
+  const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '', startDate: '', klineSrc: 'qmt', xcap: '' })
   const [rows, setRows] = useState<{
     code: string; strategy_id: string; enabled: boolean
     param_overrides: Record<string, unknown>
@@ -284,6 +285,8 @@ function LiveStatusPage() {
           orderPct: ((c.editable?.current?.risk?.max_order_value_pct ?? 0.1) * 100).toFixed(1),
           startDate: String(c.editable?.current?.paper_start_date ?? ''),
           klineSrc: String(c.editable?.current?.kline_source ?? 'qmt'),
+          // H73：null/0 = 关闭（历史行为）
+          xcap: (c.editable?.current?.cross_symbol_cap ? String(c.editable?.current?.cross_symbol_cap * 100) : ''),
         })
         setRows((c.editable?.current?.positions ?? []).map(p => ({
           code: p.code, strategy_id: p.strategy_id, enabled: p.enabled !== false,
@@ -306,6 +309,8 @@ function LiveStatusPage() {
         initial_cash: Number(form.cash),
         paper_start_date: form.startDate.trim() || null,
         kline_source: form.klineSrc,
+        // H73：留空 = 关闭跨策略闸门
+        cross_symbol_cap: form.xcap.trim() === '' ? null : Number(form.xcap) / 100,
         risk_pct: Number(form.riskPct) / 100,
         risk: {
           max_symbol_position_pct: Number(form.capPct) / 100,
@@ -612,6 +617,22 @@ function LiveStatusPage() {
                   <option value="qmt">QMT（失败自动回退 AD）</option>
                   <option value="ad">AD 星耀</option>
                 </select>
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-[11px] text-muted">
+                  跨策略单标上限(%) <span className="text-[10px] opacity-60">留空=关闭</span>
+                </span>
+                <input
+                  type="number"
+                  step="1"
+                  placeholder="关闭"
+                  value={form.xcap}
+                  onChange={e => {
+                    touchedRef.current = true
+                    setForm(prev => ({ ...prev, xcap: e.target.value }))
+                  }}
+                  className="w-28 rounded-btn border border-border bg-base px-2 py-1 text-xs"
+                />
               </label>
               <label className="block">
                 <span className="mb-1 block text-[11px] text-muted">纸面交易起点</span>

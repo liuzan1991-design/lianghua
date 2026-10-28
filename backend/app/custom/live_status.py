@@ -347,7 +347,9 @@ def _editable_view() -> dict:
         "current": {"initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
                     "positions": positions,
                     "paper_start_date": raw.get("paper_start_date"),
-                    "kline_source": raw.get("kline_source") or "qmt"},
+                    "kline_source": raw.get("kline_source") or "qmt",
+                    # H73：None = 关闭（历史行为）。开了 ⇒ 四策略合计持仓不超 该比例 × 资金基准
+                    "cross_symbol_cap": raw.get("cross_symbol_cap")},
         # 引擎实际用的起点（含兜底常量）—— 面板必须显示这个，否则用户以为改了却没用上
         "paper_start_effective": _trade_start(),
         "risk_spec": {k: {"min": v[0], "max": v[1], "label": v[2]}
@@ -381,6 +383,21 @@ def config_save(payload: dict) -> dict:
     ksrc = str(payload.get("kline_source", raw.get("kline_source") or "qmt")).strip().lower()
     if ksrc not in ("ad", "qmt", "stockdb"):
         errs.append(f"kline_source 只能是 ad / qmt / stockdb，收到 {ksrc!r}")
+
+    # H73：跨策略单标总持仓上限（占总资金比例）。留空/0 = 关闭。
+    # 开了必须有 initial_cash —— 没资金基准，占比无从计算。
+    xraw = payload.get("cross_symbol_cap", raw.get("cross_symbol_cap"))
+    xcap: float | None = None
+    if xraw not in (None, "", 0):
+        try:
+            xcap = float(xraw)
+        except (TypeError, ValueError):
+            errs.append(f"cross_symbol_cap 必须是数字，收到 {xraw!r}")
+        else:
+            if not (0 < xcap <= 1):
+                errs.append(f"cross_symbol_cap 必须在 (0, 1] 内，收到 {xcap}")
+            elif cash is None:
+                errs.append("启用 cross_symbol_cap 必须同时给出 initial_cash")
 
     # 纸面起点（H67）：留空 = 回落引擎常量；填了必须是 YYYY-MM-DD 且不在未来
     psd_raw = payload.get("paper_start_date", raw.get("paper_start_date"))
@@ -488,7 +505,8 @@ def config_save(payload: dict) -> dict:
     new_cfg.update({"version": raw.get("version", 1),
                     "initial_cash": cash, "risk_pct": risk_pct,
                     "risk": risk, "positions": positions,
-                    "paper_start_date": psd, "kline_source": ksrc})
+                    "paper_start_date": psd, "kline_source": ksrc,
+                    "cross_symbol_cap": xcap})
     new_cfg["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     # 写前备份（保留最近 5 份）
@@ -516,6 +534,7 @@ def config_save(payload: dict) -> dict:
                 "source": "tickflow-panel",
                 "initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
                 "paper_start_date": psd, "kline_source": ksrc,
+                "cross_symbol_cap": xcap,
                 "positions": [f"{p.get('code')}×{p.get('strategy_id')}" for p in positions],
             }, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001 — 审计写失败不回滚配置，但要在返回里说明
