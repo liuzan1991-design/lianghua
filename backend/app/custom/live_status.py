@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -150,6 +151,40 @@ def units() -> dict:
     return {"units": out}
 
 
+_STRATEGY_LABELS = {
+    "grid_trade": "网格交易",
+    "ma_swing": "均线波段",
+    "intraday_t": "日内做T",
+    "sentiment_t": "情绪T",
+}
+
+
+def _supported_strategies() -> list[dict]:
+    """可用策略 = quant_app 的 `_SUPPORTED_LIVE_STRATEGIES`（**唯一真相源**）。
+
+    2026-10-28 教训：面板里再抄一份白名单，必然与引擎漂移（H38 的"改一处漏两处"）。
+    这里直接读 `live_match_loop.py` 的集合字面量；读不到则退回 grid/ma_swing。
+    """
+    ids = ["grid_trade", "ma_swing"]
+    try:
+        import re as _re
+        txt = (ENGINE_ROOT / "live_match_loop.py").read_text(encoding="utf-8", errors="replace")
+        m = _re.search(r"_SUPPORTED_LIVE_STRATEGIES\s*=\s*\{([^}]*)\}", txt)
+        if m:
+            found = _re.findall(r'"([a-z_]+)"', m.group(1))
+            if found:
+                ids = found
+    except Exception:  # noqa: BLE001
+        pass
+    return [{"id": i, "label": _STRATEGY_LABELS.get(i, i)} for i in ids]
+
+
+@router.get("/strategies")
+def strategies_view() -> dict:
+    """面板策略下拉的数据源。"""
+    return {"items": _supported_strategies()}
+
+
 @router.get("/config")
 def config_view() -> dict:
     """生效配置留痕 + S5 审计尾部（config_audit.jsonl 尚不存在时给空表）。"""
@@ -263,6 +298,7 @@ def _editable_view() -> dict:
         "risk_spec": {k: {"min": v[0], "max": v[1], "label": v[2]}
                       for k, v in _RISK_SPEC.items()},
         "position_checks": checks,
+        "strategies": _supported_strategies(),
         "takes_effect": "次日 04:30 启动时生效（运行中进程不热改）",
     }
 
@@ -297,7 +333,16 @@ def config_save(payload: dict) -> dict:
         risk[k] = v
 
     positions = payload.get("positions", raw.get("positions") or [])
-    # 可行性：按**最新价**算底仓，<100 股直接拒绝（30 万 × 10% ÷ 577 = 0 股就是这个坑）
+    # 策略白名单与代码格式：面板能选什么，引擎就必须支持什么（否则启动才报错）
+    _supported = {s["id"] for s in _supported_strategies()}
+    for pos in positions:
+        _code = str(pos.get("code") or "")
+        _sid = str(pos.get("strategy_id") or "")
+        if not re.fullmatch(r"\d{6}", _code):
+            errs.append(f"代码格式不对：{_code!r}（应为 6 位数字）")
+        if _sid not in _supported:
+            errs.append(f"策略 {_sid!r} 不在 live 支持列表 {sorted(_supported)}")
+    # 可行性：按**引擎冻结价**算底仓，<100 股直接拒绝（30 万 × 12% ÷ 358 = 100 股才勉强可行）
     _checked: set[str] = set()      # 同一 code 多个策略只报一次
     for pos in positions:
         if not pos.get("enabled", True):

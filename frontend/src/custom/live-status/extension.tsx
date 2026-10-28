@@ -28,6 +28,7 @@ interface Editable {
     code: string; strategy_id: string; price: number | null
     base_position: number | null; ok: boolean; lota_pct: number | null
   }[]
+  strategies: { id: string; label: string }[]
   takes_effect: string
 }
 
@@ -139,6 +140,7 @@ function LiveStatusPage() {
   const [units, setUnits] = useState<Unit[]>([])
   const [editable, setEditable] = useState<Editable | null>(null)
   const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '' })
+  const [rows, setRows] = useState<{ code: string; strategy_id: string; enabled: boolean }[]>([])
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState<string | null>(null)
   const [saveErrs, setSaveErrs] = useState<string[]>([])
@@ -166,6 +168,9 @@ function LiveStatusPage() {
           capPct: ((c.editable?.current?.risk?.max_symbol_position_pct ?? 0.2) * 100).toFixed(1),
           orderPct: ((c.editable?.current?.risk?.max_order_value_pct ?? 0.1) * 100).toFixed(1),
         })
+        setRows((c.editable?.current?.positions ?? []).map(p => ({
+          code: p.code, strategy_id: p.strategy_id, enabled: p.enabled !== false,
+        })))
       }
       setError(null)
       setUpdatedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }))
@@ -186,6 +191,10 @@ function LiveStatusPage() {
           max_symbol_position_pct: Number(form.capPct) / 100,
           max_order_value_pct: Number(form.orderPct) / 100,
         },
+        positions: rows.map(r => ({
+          code: r.code.trim(), strategy_id: r.strategy_id,
+          enabled: r.enabled, param_overrides: {}, note: '',
+        })),
       }
       const r = await fetch(`${BASE}/config`, {
         method: 'POST',
@@ -205,7 +214,7 @@ function LiveStatusPage() {
     } finally {
       setSaving(false)
     }
-  }, [form, load])
+  }, [form, rows, load])
 
   useEffect(() => {
     load()
@@ -357,6 +366,69 @@ function LiveStatusPage() {
                   {editable.position_checks[0].base_position ?? '—'} 股
                 </span>
               )}
+            </div>
+
+            {/* 标的 × 策略（可增删） */}
+            <div className="space-y-2">
+              <div className="text-[11px] text-muted">标的 × 策略（可增删；同一标的可挂多个策略）</div>
+              {rows.map((r, i) => (
+                <div key={i} className="flex flex-wrap items-center gap-2">
+                  <input
+                    value={r.code}
+                    placeholder="6 位代码"
+                    onChange={e => {
+                      touchedRef.current = true
+                      setRows(prev => prev.map((x, j) => (j === i ? { ...x, code: e.target.value } : x)))
+                    }}
+                    className="w-28 rounded-btn border border-border bg-base px-2 py-1 text-xs"
+                  />
+                  <select
+                    value={r.strategy_id}
+                    onChange={e => {
+                      touchedRef.current = true
+                      setRows(prev => prev.map((x, j) => (j === i ? { ...x, strategy_id: e.target.value } : x)))
+                    }}
+                    className="rounded-btn border border-border bg-base px-2 py-1 text-xs"
+                  >
+                    {(editable.strategies ?? []).map(s => (
+                      <option key={s.id} value={s.id}>{s.label}（{s.id}）</option>
+                    ))}
+                  </select>
+                  <label className="flex items-center gap-1 text-[11px] text-muted">
+                    <input
+                      type="checkbox"
+                      checked={r.enabled}
+                      onChange={e => {
+                        touchedRef.current = true
+                        setRows(prev => prev.map((x, j) => (j === i ? { ...x, enabled: e.target.checked } : x)))
+                      }}
+                      className="accent-[hsl(var(--accent))]"
+                    />
+                    启用
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      touchedRef.current = true
+                      setRows(prev => prev.filter((_, j) => j !== i))
+                    }}
+                    className="rounded-btn border border-border px-2 py-1 text-[11px] hover:bg-base"
+                  >
+                    删除
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => {
+                  touchedRef.current = true
+                  const first = editable.strategies?.[0]?.id ?? 'grid_trade'
+                  setRows(prev => [...prev, { code: '', strategy_id: first, enabled: true }])
+                }}
+                className="rounded-btn border border-border px-2 py-1 text-[11px] hover:bg-base"
+              >
+                + 添加标的
+              </button>
             </div>
 
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
