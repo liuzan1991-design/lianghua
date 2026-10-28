@@ -219,7 +219,20 @@ _RISK_SPEC = {
 
 
 def _trade_start() -> str:
-    """从 live_match_loop.py 读 TRADE_START_DATE（避免在本文件里重复一份而漂移）。"""
+    """引擎**实际使用**的纸面起点（H67）。
+
+    ⚠️ 顺序必须是「先读配置、再回落常量」：起点已从硬编码 09-07 改为
+    `live_config.paper_start_date` 优先，若这里仍只读常量，就会出现
+    「面板按 09-07 校验、引擎按 10-28 冻结」——今天刚栽过一次口径不一致。
+    """
+    try:
+        raw = _read_json(ENGINE_ROOT / "data" / "live_config.json") or {}
+        d = str(raw.get("paper_start_date") or "").strip()
+        if d:
+            return d
+    except Exception:  # noqa: BLE001
+        pass
+    # 无配置 ⇒ 回落引擎兜底常量（正则读，避免本文件重复一份而漂移）
     try:
         import re as _re
         txt = (ENGINE_ROOT / "live_match_loop.py").read_text(encoding="utf-8", errors="replace")
@@ -331,7 +344,10 @@ def _editable_view() -> dict:
         "path": str(_CFG_PATH),
         "exists": _CFG_PATH.is_file(),
         "current": {"initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
-                    "positions": positions},
+                    "positions": positions,
+                    "paper_start_date": raw.get("paper_start_date")},
+        # 引擎实际用的起点（含兜底常量）—— 面板必须显示这个，否则用户以为改了却没用上
+        "paper_start_effective": _trade_start(),
         "risk_spec": {k: {"min": v[0], "max": v[1], "label": v[2]}
                       for k, v in _RISK_SPEC.items()},
         "position_checks": checks,
@@ -358,6 +374,19 @@ def config_save(payload: dict) -> dict:
     risk_pct = float(payload.get("risk_pct", raw.get("risk_pct", 0.10)))
     if not (0.02 <= risk_pct <= 0.50):
         errs.append(f"risk_pct={risk_pct} 超出 [0.02, 0.50]")
+
+    # 纸面起点（H67）：留空 = 回落引擎常量；填了必须是 YYYY-MM-DD 且不在未来
+    psd_raw = payload.get("paper_start_date", raw.get("paper_start_date"))
+    psd: str | None = None
+    if psd_raw:
+        psd = str(psd_raw).strip()
+        try:
+            _sd = datetime.strptime(psd, "%Y-%m-%d").date()
+        except ValueError:
+            errs.append(f"paper_start_date 必须是 YYYY-MM-DD，收到 {psd!r}")
+        else:
+            if _sd > datetime.now().date():
+                errs.append(f"paper_start_date={psd} 在未来，没有行情可回放")
 
     risk = dict(raw.get("risk") or {})
     for k, v in dict(payload.get("risk") or {}).items():
@@ -451,7 +480,8 @@ def config_save(payload: dict) -> dict:
     new_cfg = dict(raw)
     new_cfg.update({"version": raw.get("version", 1),
                     "initial_cash": cash, "risk_pct": risk_pct,
-                    "risk": risk, "positions": positions})
+                    "risk": risk, "positions": positions,
+                    "paper_start_date": psd})
     new_cfg["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     # 写前备份（保留最近 5 份）
@@ -478,6 +508,7 @@ def config_save(payload: dict) -> dict:
                 "at": datetime.now().isoformat(timespec="seconds"),
                 "source": "tickflow-panel",
                 "initial_cash": cash, "risk_pct": risk_pct, "risk": risk,
+                "paper_start_date": psd,
                 "positions": [f"{p.get('code')}×{p.get('strategy_id')}" for p in positions],
             }, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001 — 审计写失败不回滚配置，但要在返回里说明

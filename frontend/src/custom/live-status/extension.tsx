@@ -40,7 +40,10 @@ interface Editable {
       code: string; strategy_id: string; enabled?: boolean
       param_overrides?: Record<string, unknown>
     }[]
+    paper_start_date?: string | null
   }
+  /** 引擎实际使用的起点（含兜底常量），面板必须显示这个而不是用户填的值 */
+  paper_start_effective?: string
   risk_spec: Record<string, { min: number; max: number; label: string }>
   position_checks: {
     code: string; strategy_id: string; price: number | null
@@ -245,7 +248,7 @@ function LiveStatusPage() {
   const [summary, setSummary] = useState<Summary | null>(null)
   const [units, setUnits] = useState<Unit[]>([])
   const [editable, setEditable] = useState<Editable | null>(null)
-  const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '' })
+  const [form, setForm] = useState({ cash: '', riskPct: '', capPct: '', orderPct: '', startDate: '' })
   const [rows, setRows] = useState<{
     code: string; strategy_id: string; enabled: boolean
     param_overrides: Record<string, unknown>
@@ -278,6 +281,7 @@ function LiveStatusPage() {
           riskPct: ((c.editable?.current?.risk_pct ?? 0.1) * 100).toFixed(1),
           capPct: ((c.editable?.current?.risk?.max_symbol_position_pct ?? 0.2) * 100).toFixed(1),
           orderPct: ((c.editable?.current?.risk?.max_order_value_pct ?? 0.1) * 100).toFixed(1),
+          startDate: String(c.editable?.current?.paper_start_date ?? ''),
         })
         setRows((c.editable?.current?.positions ?? []).map(p => ({
           code: p.code, strategy_id: p.strategy_id, enabled: p.enabled !== false,
@@ -298,6 +302,7 @@ function LiveStatusPage() {
     try {
       const body = {
         initial_cash: Number(form.cash),
+        paper_start_date: form.startDate.trim() || null,
         risk_pct: Number(form.riskPct) / 100,
         risk: {
           max_symbol_position_pct: Number(form.capPct) / 100,
@@ -587,6 +592,30 @@ function LiveStatusPage() {
                   />
                 </label>
               ))}
+            </div>
+
+            {/* 纸面交易起点（H67）：留空 = 用常量兜底 */}
+            <div className="flex flex-wrap items-end gap-3 rounded-btn border border-border/50 p-2">
+              <label className="block">
+                <span className="mb-1 block text-[11px] text-muted">纸面交易起点</span>
+                <input
+                  type="date"
+                  value={form.startDate}
+                  onChange={e => {
+                    touchedRef.current = true
+                    setForm(prev => ({ ...prev, startDate: e.target.value }))
+                  }}
+                  className="rounded-btn border border-border bg-base px-2 py-1 text-xs"
+                />
+              </label>
+              <div className="text-[11px] text-muted">
+                引擎当前生效：
+                <span className="font-mono text-foreground">{editable.paper_start_effective ?? '—'}</span>
+                {!editable.current.paper_start_date && <span className="ml-1">（未设置，用常量兜底）</span>}
+                <div className="mt-0.5">
+                  改这个不会自动重放已有账户；要让新起点生效，需清掉该标的的纸面状态目录。
+                </div>
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
